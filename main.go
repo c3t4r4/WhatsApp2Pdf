@@ -75,9 +75,24 @@ func main() {
         os.Exit(1)
     }
 
-    chatFile := filepath.Join(tempDir, "_chat.txt")
-    if _, err := os.Stat(chatFile); err != nil {
-        fmt.Printf("Arquivo _chat.txt não encontrado no zip extraído (%s)\n", tempDir)
+    // Procura por qualquer arquivo .txt no diretório temporário
+    var chatFile string
+    err = filepath.Walk(tempDir, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+        if !info.IsDir() && strings.HasSuffix(strings.ToLower(path), ".txt") {
+            chatFile = path
+            return filepath.SkipAll
+        }
+        return nil
+    })
+    if err != nil {
+        fmt.Printf("Erro ao procurar arquivo .txt: %v\n", err)
+        os.Exit(1)
+    }
+    if chatFile == "" {
+        fmt.Printf("Nenhum arquivo .txt encontrado no zip extraído (%s)\n", tempDir)
         os.Exit(1)
     }
 
@@ -108,6 +123,10 @@ func unzip(src, dest string) error {
     }
     defer r.Close()
     for _, f := range r.File {
+        // Ignora arquivos da pasta __MACOSX
+        if strings.Contains(f.Name, "__MACOSX") {
+            continue
+        }
         fpath := filepath.Join(dest, f.Name)
         if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
             return fmt.Errorf("arquivo %s fora do destino", fpath)
@@ -205,21 +224,36 @@ func parseChat(chatFile string) []Message {
 
     var messages []Message
     scanner := bufio.NewScanner(file)
-    msgRegex := regexp.MustCompile(`\[(.*?)\] (.*?): (.*)`)
-    mediaRegex := regexp.MustCompile(`<anexado: ([^>]+)>`)
-    imageRegex := regexp.MustCompile(`(?i)\.(jpg|jpeg|png|gif|bmp)$`)
-    audioRegex := regexp.MustCompile(`(?i)\.(opus|mp3|wav|m4a)$`)
+    
+    // Padrão para o primeiro formato: [DD/MM/YYYY, HH:MM:SS] Nome: Mensagem
+    msgRegex1 := regexp.MustCompile(`\[(.*?)\] (.*?): (.*)`)
+    
+    // Padrão para o segundo formato: DD/MM/YYYY HH:MM - Nome: Mensagem
+    msgRegex2 := regexp.MustCompile(`(\d{2}/\d{2}/\d{4} \d{2}:\d{2}) - (.*?): (.*)`)
+    
+    // Padrão para anexos no primeiro formato
+    mediaRegex1 := regexp.MustCompile(`<anexado: ([^>]+)>`)
+    
+    // Padrão para anexos no segundo formato
+    mediaRegex2 := regexp.MustCompile(`(.*?) \(arquivo anexado\)`)
+    
+    // Padrões para diferentes tipos de mídia
+    imageRegex := regexp.MustCompile(`(?i)\.(jpg|jpeg|png|gif|bmp|webp)$`)
+    audioRegex := regexp.MustCompile(`(?i)\.(opus|mp3|wav|m4a|ogg|aac)$`)
 
     for scanner.Scan() {
         line := scanner.Text()
-        if matches := msgRegex.FindStringSubmatch(line); matches != nil {
+        
+        // Tenta primeiro o formato 1
+        if matches := msgRegex1.FindStringSubmatch(line); matches != nil {
             content := matches[3]
             media := ""
             isImg := false
             isAudio := false
-            if m := mediaRegex.FindStringSubmatch(content); m != nil {
+            
+            if m := mediaRegex1.FindStringSubmatch(content); m != nil {
                 media = m[1]
-                content = mediaRegex.ReplaceAllString(content, "")
+                content = mediaRegex1.ReplaceAllString(content, "")
                 if imageRegex.MatchString(media) {
                     isImg = true
                 }
@@ -227,6 +261,36 @@ func parseChat(chatFile string) []Message {
                     isAudio = true
                 }
             }
+            
+            messages = append(messages, Message{
+                Time:         matches[1],
+                Sender:       matches[2],
+                Content:      strings.TrimSpace(content),
+                Media:        media,
+                MediaIsImage: isImg,
+                MediaIsAudio: isAudio,
+            })
+            continue
+        }
+        
+        // Tenta o formato 2
+        if matches := msgRegex2.FindStringSubmatch(line); matches != nil {
+            content := matches[3]
+            media := ""
+            isImg := false
+            isAudio := false
+            
+            if m := mediaRegex2.FindStringSubmatch(content); m != nil {
+                media = m[1]
+                content = mediaRegex2.ReplaceAllString(content, "")
+                if imageRegex.MatchString(media) {
+                    isImg = true
+                }
+                if audioRegex.MatchString(media) {
+                    isAudio = true
+                }
+            }
+            
             messages = append(messages, Message{
                 Time:         matches[1],
                 Sender:       matches[2],
@@ -242,12 +306,86 @@ func parseChat(chatFile string) []Message {
 
 func processMedias(messages []Message, inputDir, outputMedias string) map[string]string {
     mediaMap := make(map[string]string)
+    
+    // Primeiro, vamos criar um mapa de todos os arquivos disponíveis
+    availableFiles := make(map[string]string)
+    err := filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+        if !info.IsDir() {
+            // Armazena tanto o nome original quanto em lowercase para busca case-insensitive
+            baseName := filepath.Base(path)
+            availableFiles[baseName] = path
+            availableFiles[strings.ToLower(baseName)] = path
+            
+            // Também armazena versões sem caracteres especiais
+            cleanName := strings.Map(func(r rune) rune {
+                if r >= 32 && r <= 126 {
+                    return r
+                }
+                return -1
+            }, baseName)
+            if cleanName != baseName {
+                availableFiles[cleanName] = path
+                availableFiles[strings.ToLower(cleanName)] = path
+            }
+        }
+        return nil
+    })
+    if err != nil {
+        fmt.Printf("Erro ao listar arquivos: %v\n", err)
+        return mediaMap
+    }
+
     for _, msg := range messages {
         if msg.Media == "" {
             continue
         }
-        src := filepath.Join(inputDir, msg.Media)
-        if strings.HasSuffix(strings.ToLower(msg.Media), ".opus") {
+
+        // Tenta encontrar o arquivo de várias formas
+        var src string
+        mediaName := msg.Media
+
+        // Remove caracteres especiais do nome do arquivo
+        cleanMediaName := strings.Map(func(r rune) rune {
+            if r >= 32 && r <= 126 {
+                return r
+            }
+            return -1
+        }, mediaName)
+
+        // 1. Busca exata
+        if path, ok := availableFiles[mediaName]; ok {
+            src = path
+        } else if path, ok := availableFiles[cleanMediaName]; ok {
+            src = path
+        } else {
+            // 2. Busca case-insensitive
+            if path, ok := availableFiles[strings.ToLower(mediaName)]; ok {
+                src = path
+            } else if path, ok := availableFiles[strings.ToLower(cleanMediaName)]; ok {
+                src = path
+            } else {
+                // 3. Busca por padrão (para arquivos com nomes similares)
+                for availableName, path := range availableFiles {
+                    if strings.Contains(strings.ToLower(availableName), strings.ToLower(mediaName)) ||
+                       strings.Contains(strings.ToLower(availableName), strings.ToLower(cleanMediaName)) {
+                        src = path
+                        break
+                    }
+                }
+            }
+        }
+
+        if src == "" {
+            fmt.Printf("Mídia não encontrada: %s\n", msg.Media)
+            continue
+        }
+
+        // Processa o arquivo baseado na extensão
+        ext := strings.ToLower(filepath.Ext(src))
+        if ext == ".opus" {
             mp3Name := strings.TrimSuffix(msg.Media, ".opus") + ".mp3"
             dst := filepath.Join(outputMedias, mp3Name)
             if _, err := os.Stat(dst); os.IsNotExist(err) {
