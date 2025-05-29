@@ -25,6 +25,8 @@ var (
     macArial3       = `/System/Library/Fonts/Arial.ttf`
 )
 
+var Version = "dev"
+
 func main() {
     // Verificação obrigatória do ffmpeg
     if _, err := exec.LookPath("ffmpeg"); err != nil {
